@@ -232,3 +232,121 @@ func TestMessageType_Constants(t *testing.T) {
 	assert.Equal(t, MessageType("catalogizer-announce"), TypeAnnounce)
 	assert.Equal(t, MessageType("catalogizer-discover"), TypeDiscover)
 }
+
+func TestNewResponder_Defaults(t *testing.T) {
+	info := ServiceInfo{Service: "test", Host: "1.2.3.4", Port: 8080}
+	r := NewResponder(info, 0)
+	assert.Equal(t, DefaultResponderPort, r.port)
+	assert.Equal(t, TypeAnnounce, r.info.Type)
+	assert.False(t, r.running)
+}
+
+func TestNewResponder_CustomPort(t *testing.T) {
+	info := ServiceInfo{Service: "test"}
+	r := NewResponder(info, 55555)
+	assert.Equal(t, 55555, r.port)
+}
+
+func TestResponder_StartStop(t *testing.T) {
+	info := ServiceInfo{
+		Service:  "catalogizer-api",
+		Version:  "1.0.0",
+		Host:     "127.0.0.1",
+		Port:     8080,
+		Protocol: "http",
+	}
+	// Use a high port to avoid conflicts
+	r := NewResponder(info, 42080)
+	err := r.Start()
+	require.NoError(t, err)
+	assert.True(t, r.running)
+
+	// Double start should be no-op
+	err = r.Start()
+	require.NoError(t, err)
+
+	r.Stop()
+	assert.False(t, r.running)
+
+	// Double stop should be safe
+	r.Stop()
+}
+
+func TestResponder_UpdateInfo(t *testing.T) {
+	info := ServiceInfo{Service: "v1", Host: "1.2.3.4", Port: 8080}
+	r := NewResponder(info, 42081)
+	newInfo := ServiceInfo{Service: "v2", Host: "5.6.7.8", Port: 9090}
+	r.UpdateInfo(newInfo)
+	assert.Equal(t, "v2", r.info.Service)
+	assert.Equal(t, "5.6.7.8", r.info.Host)
+	assert.Equal(t, TypeAnnounce, r.info.Type)
+}
+
+func TestResponder_RepliesToDiscoveryRequest(t *testing.T) {
+	info := ServiceInfo{
+		Service:  "catalogizer-api",
+		Version:  "test",
+		Host:     "127.0.0.1",
+		Port:     8080,
+		Protocol: "http",
+		Name:     "Test Server",
+	}
+
+	port := 42082
+	r := NewResponder(info, port)
+	err := r.Start()
+	require.NoError(t, err)
+	defer r.Stop()
+
+	// Send a discovery request from a client
+	serverAddr, err := net.ResolveUDPAddr("udp4", "127.0.0.1:42082")
+	require.NoError(t, err)
+
+	clientConn, err := net.DialUDP("udp4", nil, serverAddr)
+	require.NoError(t, err)
+	defer clientConn.Close()
+
+	_, err = clientConn.Write([]byte("CATALOGIZER_DISCOVER"))
+	require.NoError(t, err)
+
+	// Read the response
+	require.NoError(t, clientConn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 4096)
+	n, err := clientConn.Read(buf)
+	require.NoError(t, err)
+	assert.Greater(t, n, 0)
+
+	var received ServiceInfo
+	err = json.Unmarshal(buf[:n], &received)
+	require.NoError(t, err)
+	assert.Equal(t, TypeAnnounce, received.Type)
+	assert.Equal(t, "catalogizer-api", received.Service)
+	assert.Equal(t, 8080, received.Port)
+	assert.Equal(t, "Test Server", received.Name)
+}
+
+func TestResponder_IgnoresInvalidMessages(t *testing.T) {
+	info := ServiceInfo{Service: "test", Host: "127.0.0.1", Port: 8080}
+	port := 42083
+	r := NewResponder(info, port)
+	err := r.Start()
+	require.NoError(t, err)
+	defer r.Stop()
+
+	serverAddr, err := net.ResolveUDPAddr("udp4", "127.0.0.1:42083")
+	require.NoError(t, err)
+
+	clientConn, err := net.DialUDP("udp4", nil, serverAddr)
+	require.NoError(t, err)
+	defer clientConn.Close()
+
+	// Send a garbage message
+	_, err = clientConn.Write([]byte("HELLO_WORLD"))
+	require.NoError(t, err)
+
+	// Should NOT get a response (timeout expected)
+	require.NoError(t, clientConn.SetReadDeadline(time.Now().Add(1*time.Second)))
+	buf := make([]byte, 4096)
+	_, err = clientConn.Read(buf)
+	assert.Error(t, err) // should be a timeout error
+}

@@ -290,3 +290,129 @@ func toSlice(m map[string]ServiceInfo) []ServiceInfo {
 	}
 	return result
 }
+
+// DefaultResponderPort is the default UDP port for the discovery responder.
+// Clients send a discovery request to this port via broadcast; the responder
+// replies with the service info directly to the sender.
+const DefaultResponderPort = 19820
+
+// Responder listens on a UDP port for discovery requests and replies with
+// the current service info. Unlike the Announcer (which proactively multicasts),
+// the Responder is reactive: it only sends service info when a client asks.
+//
+// Client protocol:
+//
+//	1. Client sends a UDP broadcast to port 19820 with body "CATALOGIZER_DISCOVER"
+//	2. Responder replies with JSON-encoded ServiceInfo to the sender's address
+type Responder struct {
+	info    ServiceInfo
+	port    int
+	conn    *net.UDPConn
+	mu      sync.Mutex
+	running bool
+	stopCh  chan struct{}
+}
+
+// NewResponder creates a Responder that will reply to discovery requests
+// with the given service info. If port is 0, DefaultResponderPort is used.
+func NewResponder(info ServiceInfo, port int) *Responder {
+	if port == 0 {
+		port = DefaultResponderPort
+	}
+	info.Type = TypeAnnounce
+	return &Responder{
+		info:   info,
+		port:   port,
+		stopCh: make(chan struct{}),
+	}
+}
+
+// Start begins listening for discovery requests. Safe to call multiple times.
+func (r *Responder) Start() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.running {
+		return nil
+	}
+
+	addr, err := net.ResolveUDPAddr("udp4", fmt.Sprintf(":%d", r.port))
+	if err != nil {
+		return fmt.Errorf("resolve responder addr: %w", err)
+	}
+
+	conn, err := net.ListenUDP("udp4", addr)
+	if err != nil {
+		return fmt.Errorf("listen responder: %w", err)
+	}
+	r.conn = conn
+	r.running = true
+
+	go r.loop()
+	return nil
+}
+
+// Stop halts the responder and closes the connection.
+func (r *Responder) Stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.running {
+		return
+	}
+	r.running = false
+	close(r.stopCh)
+	if r.conn != nil {
+		r.conn.Close()
+	}
+}
+
+// UpdateInfo atomically updates the service info for future responses.
+func (r *Responder) UpdateInfo(info ServiceInfo) {
+	r.mu.Lock()
+	info.Type = TypeAnnounce
+	r.info = info
+	r.mu.Unlock()
+}
+
+func (r *Responder) loop() {
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		default:
+		}
+
+		// Short read deadline so we can check stopCh periodically
+		if err := r.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+			return
+		}
+
+		n, remoteAddr, err := r.conn.ReadFromUDP(buf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			// Connection closed or fatal error
+			return
+		}
+
+		msg := string(buf[:n])
+		if msg != "CATALOGIZER_DISCOVER" {
+			continue
+		}
+
+		r.mu.Lock()
+		info := r.info
+		r.mu.Unlock()
+
+		data, err := json.Marshal(info)
+		if err != nil {
+			log.Printf("[broadcast] responder marshal error: %v", err)
+			continue
+		}
+
+		if _, err := r.conn.WriteToUDP(data, remoteAddr); err != nil {
+			log.Printf("[broadcast] responder reply error: %v", err)
+		}
+	}
+}
