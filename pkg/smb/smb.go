@@ -96,7 +96,16 @@ func (s *Scanner) Scan(ctx context.Context) ([]*scanner.Service, error) {
 
 // ScanHost discovers SMB services on a specific host by attempting
 // TCP connections to the configured SMB ports.
+//
+// Empty host strings are rejected early: `net.JoinHostPort("", port)`
+// produces `:port` which resolves to localhost, which would accidentally
+// discover any local SMB daemon and break the "no host → no results"
+// contract that callers rely on.
 func (s *Scanner) ScanHost(ctx context.Context, host string) ([]*scanner.Service, error) {
+	if host == "" {
+		return nil, nil
+	}
+
 	var services []*scanner.Service
 
 	for _, port := range s.config.Ports {
