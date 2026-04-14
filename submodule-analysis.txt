@@ -1,0 +1,8 @@
+Commit: eae18c077ca9cedbf4e61a399103b0a1a768168f
+Branch: main
+eae18c0 fix(smb): reject empty host string in ScanHost
+a2e84db MANDATORY: Add ZERO UNFINISHED WORK POLICY to AGENTS.md
+a472ba6 Add GitHub Sponsors button for vasic-digital
+1eeb17d security: Add mandatory NO SUDO/ROOT execution constraint
+26cf0f7 feat: v2.2.0 comprehensive completion — edge tests, version alignment
+
