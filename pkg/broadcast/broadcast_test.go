@@ -229,8 +229,39 @@ func TestToSlice_Empty(t *testing.T) {
 }
 
 func TestMessageType_Constants(t *testing.T) {
-	assert.Equal(t, MessageType("catalogizer-announce"), TypeAnnounce)
-	assert.Equal(t, MessageType("catalogizer-discover"), TypeDiscover)
+	// The library ships a generic default namespace ("vasic"). Any
+	// downstream project can override via Config.MessageNamespace to
+	// pin its own wire identity without touching the library.
+	assert.Equal(t, MessageType("vasic-announce"), TypeAnnounce)
+	assert.Equal(t, MessageType("vasic-discover"), TypeDiscover)
+}
+
+func TestMessageTypeFor_CustomNamespace(t *testing.T) {
+	// A consumer that wants a private wire namespace (for example
+	// the catalog-api back-end preserving its historical
+	// "catalogizer-*" identity) overrides MessageNamespace.
+	assert.Equal(t, MessageType("catalogizer-announce"),
+		messageTypeFor("catalogizer", "announce"))
+	assert.Equal(t, MessageType("myapp-discover"),
+		messageTypeFor("myapp", "discover"))
+}
+
+func TestNewAnnouncer_HonoursCustomNamespace(t *testing.T) {
+	info := ServiceInfo{Service: "svc"}
+	a := NewAnnouncer(info, Config{MessageNamespace: "custom"})
+	assert.Equal(t, MessageType("custom-announce"), a.info.Type)
+	assert.Equal(t, MessageType("custom-announce"), a.announceTyp)
+}
+
+func TestNewResponderWithConfig_HonoursCustomNamespace(t *testing.T) {
+	info := ServiceInfo{Service: "svc", Host: "1.2.3.4", Port: 8080}
+	r := NewResponderWithConfig(info, Config{
+		Port:             0,
+		MessageNamespace: "catalogizer",
+	})
+	assert.Equal(t, DefaultResponderPort, r.port)
+	assert.Equal(t, "CATALOGIZER_DISCOVER", r.probeBody)
+	assert.Equal(t, MessageType("catalogizer-announce"), r.info.Type)
 }
 
 func TestNewResponder_Defaults(t *testing.T) {
@@ -298,7 +329,10 @@ func TestResponder_RepliesToDiscoveryRequest(t *testing.T) {
 	require.NoError(t, err)
 	defer r.Stop()
 
-	// Send a discovery request from a client
+	// Send a discovery request from a client. The probe body is
+	// derived from the responder's MessageNamespace — the default
+	// namespace is "vasic" so the default probe body is
+	// "VASIC_DISCOVER".
 	serverAddr, err := net.ResolveUDPAddr("udp4", "127.0.0.1:42082")
 	require.NoError(t, err)
 
@@ -306,7 +340,7 @@ func TestResponder_RepliesToDiscoveryRequest(t *testing.T) {
 	require.NoError(t, err)
 	defer clientConn.Close()
 
-	_, err = clientConn.Write([]byte("CATALOGIZER_DISCOVER"))
+	_, err = clientConn.Write([]byte("VASIC_DISCOVER"))
 	require.NoError(t, err)
 
 	// Read the response

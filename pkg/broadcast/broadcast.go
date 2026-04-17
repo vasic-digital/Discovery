@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: MIT
 
 // Package broadcast provides UDP multicast service announcement and discovery
-// for Catalogizer API instances on a local network.
+// for any service instance on a local network. The package is a
+// general-purpose building block — it holds no project-specific
+// defaults and can be reused by any HTTP, gRPC, or TCP service that
+// wants to advertise itself to peers.
 //
-// The Announcer periodically broadcasts the API's presence via UDP multicast.
-// The Listener receives these broadcasts and returns discovered services.
-// Clients use the Listener to find API instances without knowing their addresses.
+// The Announcer periodically broadcasts the service's presence via UDP
+// multicast. The Listener receives these broadcasts and returns
+// discovered services. Clients use the Listener to find service
+// instances without knowing their addresses.
+//
+// The wire-protocol message namespace is configurable via Config so
+// projects that share a LAN can isolate their own announcements from
+// other broadcasters using the same multicast group. See
+// Config.MessageNamespace for details.
 package broadcast
 
 import (
@@ -14,11 +23,13 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
 
-// DefaultMulticastGroup is the multicast address for Catalogizer discovery.
+// DefaultMulticastGroup is the default multicast address for service
+// discovery broadcasts.
 const DefaultMulticastGroup = "239.42.42.42"
 
 // DefaultPort is the default UDP port for discovery broadcasts.
@@ -30,14 +41,35 @@ const DefaultInterval = 5 * time.Second
 // DefaultTimeout is the default discovery listen timeout.
 const DefaultTimeout = 5 * time.Second
 
-// MessageType identifies the purpose of a broadcast message.
+// DefaultMessageNamespace is the default prefix applied to the wire
+// type strings. Projects that share a LAN should set their own
+// namespace via Config.MessageNamespace so their announcements do
+// not collide with other broadcasters on 239.42.42.42.
+const DefaultMessageNamespace = "vasic"
+
+// MessageType identifies the purpose of a broadcast message. The
+// concrete string is built from MessageNamespace + "-announce" or
+// "-discover" at Announcer / Listener construction time so each
+// project can pin a unique wire identifier.
 type MessageType string
 
+// messageTypeFor returns the namespaced wire value for kind.
+func messageTypeFor(namespace, kind string) MessageType {
+	if namespace == "" {
+		namespace = DefaultMessageNamespace
+	}
+	return MessageType(namespace + "-" + kind)
+}
+
 const (
-	// TypeAnnounce indicates an API instance announcing its presence.
-	TypeAnnounce MessageType = "catalogizer-announce"
-	// TypeDiscover indicates a client requesting API instances to identify.
-	TypeDiscover MessageType = "catalogizer-discover"
+	// TypeAnnounce is the DEFAULT announce wire value, used when the
+	// caller did not set Config.MessageNamespace. It exists only for
+	// backward compatibility — new code should read the type from the
+	// running Announcer / Listener which honours the config.
+	TypeAnnounce MessageType = "vasic-announce"
+	// TypeDiscover is the DEFAULT discovery wire value; same caveat
+	// as TypeAnnounce.
+	TypeDiscover MessageType = "vasic-discover"
 )
 
 // ServiceInfo describes a discovered Catalogizer API instance.
@@ -63,26 +95,34 @@ type Config struct {
 	Port           int
 	Interval       time.Duration
 	Timeout        time.Duration
+	// MessageNamespace disambiguates wire messages so projects that
+	// share a LAN do not cross-subscribe to each other's broadcasts.
+	// The announce / discover MessageType values are derived as
+	// "<namespace>-announce" / "<namespace>-discover". Empty falls
+	// back to DefaultMessageNamespace.
+	MessageNamespace string
 }
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		MulticastGroup: DefaultMulticastGroup,
-		Port:           DefaultPort,
-		Interval:       DefaultInterval,
-		Timeout:        DefaultTimeout,
+		MulticastGroup:   DefaultMulticastGroup,
+		Port:             DefaultPort,
+		Interval:         DefaultInterval,
+		Timeout:          DefaultTimeout,
+		MessageNamespace: DefaultMessageNamespace,
 	}
 }
 
 // Announcer periodically broadcasts service presence via UDP multicast.
 type Announcer struct {
-	config  Config
-	info    ServiceInfo
-	conn    *net.UDPConn
-	mu      sync.Mutex
-	running bool
-	stopCh  chan struct{}
+	config      Config
+	announceTyp MessageType
+	info        ServiceInfo
+	conn        *net.UDPConn
+	mu          sync.Mutex
+	running     bool
+	stopCh      chan struct{}
 }
 
 // NewAnnouncer creates an Announcer that will broadcast the given service info.
@@ -96,11 +136,16 @@ func NewAnnouncer(info ServiceInfo, cfg Config) *Announcer {
 	if cfg.Interval == 0 {
 		cfg.Interval = DefaultInterval
 	}
-	info.Type = TypeAnnounce
+	if cfg.MessageNamespace == "" {
+		cfg.MessageNamespace = DefaultMessageNamespace
+	}
+	announceTyp := messageTypeFor(cfg.MessageNamespace, "announce")
+	info.Type = announceTyp
 	return &Announcer{
-		config: cfg,
-		info:   info,
-		stopCh: make(chan struct{}),
+		config:      cfg,
+		announceTyp: announceTyp,
+		info:        info,
+		stopCh:      make(chan struct{}),
 	}
 }
 
@@ -146,7 +191,7 @@ func (a *Announcer) Stop() {
 // UpdateInfo atomically updates the service info for future broadcasts.
 func (a *Announcer) UpdateInfo(info ServiceInfo) {
 	a.mu.Lock()
-	info.Type = TypeAnnounce
+	info.Type = a.announceTyp
 	a.info = info
 	a.mu.Unlock()
 }
@@ -190,10 +235,14 @@ func (a *Announcer) send() {
 	}
 }
 
-// Listener discovers Catalogizer API instances by listening for multicast
-// announcements on the local network.
+// Listener discovers service instances by listening for multicast
+// announcements on the local network. The wire message namespace is
+// drawn from Config.MessageNamespace so any project can isolate its
+// own announcements from other broadcasters sharing the multicast
+// group.
 type Listener struct {
-	config Config
+	config      Config
+	announceTyp MessageType
 }
 
 // NewListener creates a Listener with the given configuration.
@@ -207,7 +256,13 @@ func NewListener(cfg Config) *Listener {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = DefaultTimeout
 	}
-	return &Listener{config: cfg}
+	if cfg.MessageNamespace == "" {
+		cfg.MessageNamespace = DefaultMessageNamespace
+	}
+	return &Listener{
+		config:      cfg,
+		announceTyp: messageTypeFor(cfg.MessageNamespace, "announce"),
+	}
 }
 
 // Discover listens for service announcements until the context is cancelled
@@ -260,7 +315,7 @@ func (l *Listener) Discover(ctx context.Context) ([]ServiceInfo, error) {
 		if err := json.Unmarshal(buf[:n], &info); err != nil {
 			continue
 		}
-		if info.Type != TypeAnnounce {
+		if info.Type != l.announceTyp {
 			continue
 		}
 
@@ -302,28 +357,55 @@ const DefaultResponderPort = 19820
 //
 // Client protocol:
 //
-//	1. Client sends a UDP broadcast to port 19820 with body "CATALOGIZER_DISCOVER"
+//	1. Client sends a UDP broadcast to port 19820 with body
+//	   "<NAMESPACE>_DISCOVER" (uppercase of the configured
+//	   MessageNamespace). The default namespace is "vasic" so the
+//	   default probe body is "VASIC_DISCOVER"; projects that override
+//	   the namespace override the probe body accordingly.
 //	2. Responder replies with JSON-encoded ServiceInfo to the sender's address
 type Responder struct {
-	info    ServiceInfo
-	port    int
-	conn    *net.UDPConn
-	mu      sync.Mutex
-	running bool
-	stopCh  chan struct{}
+	info        ServiceInfo
+	port        int
+	probeBody   string
+	announceTyp MessageType
+	conn        *net.UDPConn
+	mu          sync.Mutex
+	running     bool
+	stopCh      chan struct{}
 }
 
-// NewResponder creates a Responder that will reply to discovery requests
-// with the given service info. If port is 0, DefaultResponderPort is used.
+// NewResponder creates a Responder using the default message
+// namespace. Port 0 falls back to DefaultResponderPort. New code
+// should prefer NewResponderWithConfig so the wire namespace is
+// explicit.
 func NewResponder(info ServiceInfo, port int) *Responder {
+	return NewResponderWithConfig(info, Config{
+		Port:             port,
+		MessageNamespace: DefaultMessageNamespace,
+	})
+}
+
+// NewResponderWithConfig creates a Responder from a full Config so
+// callers can pin the UDP port and the wire message namespace. An
+// empty cfg.Port resolves to DefaultResponderPort; an empty
+// cfg.MessageNamespace resolves to DefaultMessageNamespace.
+func NewResponderWithConfig(info ServiceInfo, cfg Config) *Responder {
+	port := cfg.Port
 	if port == 0 {
 		port = DefaultResponderPort
 	}
-	info.Type = TypeAnnounce
+	ns := cfg.MessageNamespace
+	if ns == "" {
+		ns = DefaultMessageNamespace
+	}
+	announceTyp := messageTypeFor(ns, "announce")
+	info.Type = announceTyp
 	return &Responder{
-		info:   info,
-		port:   port,
-		stopCh: make(chan struct{}),
+		info:        info,
+		port:        port,
+		probeBody:   strings.ToUpper(ns) + "_DISCOVER",
+		announceTyp: announceTyp,
+		stopCh:      make(chan struct{}),
 	}
 }
 
@@ -368,7 +450,7 @@ func (r *Responder) Stop() {
 // UpdateInfo atomically updates the service info for future responses.
 func (r *Responder) UpdateInfo(info ServiceInfo) {
 	r.mu.Lock()
-	info.Type = TypeAnnounce
+	info.Type = r.announceTyp
 	r.info = info
 	r.mu.Unlock()
 }
@@ -397,7 +479,7 @@ func (r *Responder) loop() {
 		}
 
 		msg := string(buf[:n])
-		if msg != "CATALOGIZER_DISCOVER" {
+		if msg != r.probeBody {
 			continue
 		}
 
