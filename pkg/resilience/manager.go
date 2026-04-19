@@ -130,9 +130,24 @@ func (m *Manager) GetSourceStatus(id string) (*Source, error) {
 	src.Lock()
 	defer src.Unlock()
 
-	// Return a shallow copy so the caller cannot mutate internal state.
-	cp := *src
-	return &cp, nil
+	// Return a field-by-field copy so the caller cannot mutate internal state.
+	// Copying via struct literal avoids copying the embedded sync.Mutex,
+	// which vet (and the race detector) flag as incorrect.
+	cp := &Source{
+		ID:                  src.ID,
+		Name:                src.Name,
+		Endpoint:            src.Endpoint,
+		State:               src.State,
+		LastConnected:       src.LastConnected,
+		LastError:           src.LastError,
+		RetryAttempts:       src.RetryAttempts,
+		MaxRetryAttempts:    src.MaxRetryAttempts,
+		RetryDelay:          src.RetryDelay,
+		ConnectionTimeout:   src.ConnectionTimeout,
+		HealthCheckInterval: src.HealthCheckInterval,
+		IsEnabled:           src.IsEnabled,
+	}
+	return cp, nil
 }
 
 // SourceCount returns the number of registered sources.
